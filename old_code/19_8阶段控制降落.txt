@@ -1,0 +1,312 @@
+function sysCall_init()
+    -- Make sure we have version 2.4.13 or above (the particles are not supported otherwise)
+    v=sim.getInt32Parameter(sim.intparam_program_version)
+    if (v<20413) then
+        sim.displayDialog('Warning','The propeller model is only fully supported from V-REP version 2.4.13 and above.&&nThis simulation will not run as expected!',sim.dlgstyle_ok,false,'',nil,{0.8,0,0,0,0,0})
+    end
+
+    -- Detatch the manipulation sphere:
+    targetObj=sim.getObjectHandle('Quadricopter_target')
+    sim.setObjectParent(targetObj,-1,true)
+
+    -- This control algo was quickly written and is dirty and not optimal. It just serves as a SIMPLE example
+
+    d=sim.getObjectHandle('Quadricopter_base')
+    hand_handle=sim.getObjectHandle('JacoHand')
+    quadricopter=sim.getObjectHandle('Quadricopter')
+    quadricopter_prop_respondable1=sim.getObjectHandle('Quadricopter_propeller_respondable1')
+
+    particlesAreVisible=sim.getScriptSimulationParameter(sim.handle_self,'particlesAreVisible')
+    sim.setScriptSimulationParameter(sim.handle_tree,'particlesAreVisible',tostring(particlesAreVisible))
+    simulateParticles=sim.getScriptSimulationParameter(sim.handle_self,'simulateParticles')
+    sim.setScriptSimulationParameter(sim.handle_tree,'simulateParticles',tostring(simulateParticles))
+
+    propellerScripts={-1,-1,-1,-1}
+    for i=1,4,1 do
+        propellerScripts[i]=sim.getScriptHandle('Quadricopter_propeller_respondable'..i)
+    end
+    heli=sim.getObjectAssociatedWithScript(sim.handle_self)
+    hand_script_handle = sim.getScriptHandle('JacoHand')
+    print('hand_script_handle', hand_script_handle)
+    
+    particlesTargetVelocities={0,0,0,0}
+
+    -- landing gear
+    revolute0 = sim.getObjectHandle('Revolute_joint0')
+    revolute1 = sim.getObjectHandle('Revolute_joint1')
+    sim.setJointTargetPosition(revolute0,math.rad(85))
+    sim.setJointTargetPosition(revolute1,math.rad(85))
+    
+    pParam=6
+    iParam=0.04
+    dParam=0.08
+    vParam=-2
+
+    cumul=0
+    lastE=0
+    pAlphaE=0
+    pBetaE=0
+    alphaCumul=0
+    betaCumul=0
+    rotCorrCumul=0
+    psp2=0
+    psp1=0
+    spCumul=0
+
+    prevEuler=0
+
+    maxCorr=2
+    initialTime=1
+    deltaSpeed=0
+
+    ctrl0_target_distance=0
+
+    fakeShadow=sim.getScriptSimulationParameter(sim.handle_self,'fakeShadow')
+    if (fakeShadow) then
+        shadowCont=sim.addDrawingObject(sim.drawing_discpoints+sim.drawing_cyclic+sim.drawing_25percenttransparency+sim.drawing_50percenttransparency+sim.drawing_itemsizes,0.2,0,-1,1)
+    end
+
+    -- Prepare 2 floating views with the zed camera views:
+    zed_vision0 = sim.getObjectHandle('zed_vision0')
+    zed_vision1 = sim.getObjectHandle('zed_vision1')
+
+    zed_v0_View=sim.floatingViewAdd(0.9,0.9,0.2,0.2,0)
+    zed_v1_View=sim.floatingViewAdd(0.7,0.9,0.2,0.2,0)
+    sim.adjustView(zed_v0_View,zed_vision0,64)
+    sim.adjustView(zed_v1_View,zed_vision1,64)
+
+    end_vector = {0,0,0.14}
+    t_sim_start = sim.getSimulationTime()
+    grapped = false
+    speed = -1 -- m/s
+    hold_time = 0.5 -- s
+    distance_hold = 0.11
+    start_position = sim.getObjectPosition(targetObj, -1)
+
+    ------------------ Initialize position -------------------------------------
+    targetPos=sim.getObjectPosition(targetObj,-1)
+
+    ------------------ State counter -------------------------------------
+    -- main control flag
+    ctrl_flag=0
+    -- 0 nothing
+    -- 1 found pic: land down
+    -- 2 not found: fly up
+    -- 3 landing stage: wait for secs, keep in sight, then land down
+    ctrl_flag_last_time=0
+    -- time remaining for this control flag before another decision
+    
+
+    ctrl_speed_x=0
+    ctrl_speed_y=0 -- [-2, 2]. speed.
+
+    ctrl_speed_max=0.05
+
+    ctrl_angle_x=0
+    ctrl_angle_y=0 -- [-0.1, 0.1]. angle.
+    
+    ctrl_angle_max=0.5 -- max angle allowed for flight(rad):0.3
+
+    linearSpeed_midway={0,0,0}
+
+    descend_flag_max=0.02 -- max descend speed
+
+    target_height=targetPos[3]
+    target_height_change_speed=0 --landing or rising speed
+    last_target_height=targetPos[3]
+
+    ------------------ Obstacles position -------------------------------------
+    target_platform = sim.getObjectHandle('Car')
+    target_platform_pos = sim.getObjectPosition(target_platform, -1)
+
+
+
+end
+
+function sysCall_cleanup() 
+    sim.removeDrawingObject(shadowCont)
+    sim.floatingViewRemove(zed_v0_View)
+    sim.floatingViewRemove(zed_v1_View)
+end 
+
+function normalization(vector, length)
+    temp=math.sqrt(math.pow(vector[1],2)+math.pow(vector[2],2))
+    vector[1]=vector[1]/temp*length
+    vector[2]=vector[2]/temp*length
+    return vector
+end
+
+
+function sysCall_actuation() 
+    ------------------ Get position -------------------------------------
+    s=sim.getObjectSizeFactor(d)
+    pos=sim.getObjectPosition(d,-1)
+
+    m=sim.getObjectMatrix(d,-1)
+    sim.invertMatrix(m)
+    m[4]=0
+    m[8]=0
+    m[12]=0
+
+    euler=sim.getObjectOrientation(d,targetObj)
+    linearSpeed_resolute, angularSpeed=sim.getObjectVelocity(d)
+    linearSpeed = sim.multiplyVector(m,linearSpeed_resolute)
+
+    if (fakeShadow) then
+        itemData={pos[1],pos[2],0.002,0,0,1,0.2*s}
+        sim.addDrawingObjectItem(shadowCont,itemData)
+    end
+
+    ------------------ Path Planning -------------------------------------
+    
+    --control flag = 0: plan path
+    --control flag = 1: accelerate
+    --control flag = 2: decelerate 
+    --control flag = 3: slower decelerate
+    --control flag = 4: stableize
+    linearSpeedTotal=math.sqrt(math.pow(linearSpeed_resolute[1],2)+math.pow(linearSpeed_resolute[2],2))
+    target_distance=math.sqrt(math.pow(pos[1]-target_platform_pos[1],2)+math.pow(pos[2]-target_platform_pos[2],2))
+        
+    print(linearSpeedTotal,ctrl_flag,target_distance)
+    target_pushforce=normalization({pos[1]-target_platform_pos[1], pos[2]-target_platform_pos[2]}, 1)
+    total_force_resolute = {target_pushforce[1],target_pushforce[2],0,0}        
+    total_force=sim.multiplyVector(m,total_force_resolute)
+
+    if(ctrl_flag==0) then
+        ctrl_flag = ctrl_flag + 1
+        ctrl0_target_distance=math.sqrt(math.pow(pos[1]-target_platform_pos[1],2)+math.pow(pos[2]-target_platform_pos[2],2))
+
+
+        
+    elseif(ctrl_flag==1) then
+        
+        --speed = 2: stop acceleration. when acc slowly returns to 0, speed stables at 3.5.
+
+        if(linearSpeedTotal < 2.5)then
+            ctrl_angle_x = total_force[1] * ctrl_angle_max
+            ctrl_angle_y = total_force[2] * ctrl_angle_max
+        else
+            ctrl_angle_x = 0
+            ctrl_angle_y = 0
+            print("speedeuqal")
+        end
+
+        -- reached halfway: start deceleration
+
+        if(target_distance < linearSpeedTotal * linearSpeedTotal / 5)then ctrl_flag = ctrl_flag + 1 end
+
+    elseif(ctrl_flag==2) then
+
+        -- a fast deceleration
+
+        ctrl_angle_x = linearSpeed[1]/linearSpeedTotal * ctrl_angle_max
+        ctrl_angle_y = linearSpeed[2]/linearSpeedTotal * ctrl_angle_max
+
+        -- slow down deceleration rate
+        if(linearSpeedTotal < 1)then ctrl_flag = ctrl_flag + 1 end
+    
+    elseif(ctrl_flag==3) then
+
+        ctrl_angle_x = linearSpeed[1] * ctrl_angle_max / 3
+        ctrl_angle_y = linearSpeed[2] * ctrl_angle_max / 3
+
+        --speed halfened. only need minor fixes, ctrl_angle be arount zero
+        --to avoid drifting backwards.
+
+        if(linearSpeedTotal < 0.5)then ctrl_flag = ctrl_flag + 1 end
+  
+    elseif(ctrl_flag==4) then
+        ctrl_angle_x = linearSpeed[1] * ctrl_angle_max / 4
+        ctrl_angle_y = linearSpeed[2] * ctrl_angle_max / 4
+
+        --stablized. only minor nudges needed to approach target.
+
+        if(linearSpeedTotal < 0.1)then             
+            ctrl_flag = ctrl_flag + 1
+
+            --close enough: skip this step.
+            if(target_distance < 0.1) then ctrl_flag = ctrl_flag + 1 end
+            ctrl5_distance = target_distance
+        end
+    elseif(ctrl_flag==5) then
+
+        if(target_distance > ctrl5_distance * 0.8) then
+            --accelerate
+            ctrl_angle_x = total_force[1] * ctrl_angle_max / 5
+            ctrl_angle_y = total_force[2] * ctrl_angle_max / 5
+        else
+            --decelerate
+            ctrl_angle_x = linearSpeed[1] * ctrl_angle_max / 3
+            ctrl_angle_y = linearSpeed[2] * ctrl_angle_max / 3
+
+            if(linearSpeedTotal < 0.1) then        
+                if(target_distance < 0.1) then
+                    ctrl_flag_last_time = 10
+                    ctrl_flag = ctrl_flag + 1
+                else
+                    ctrl5_distance = target_distance
+                end
+            end
+        end
+    elseif(ctrl_flag==6) then
+        --stablize
+        ctrl_angle_x = 0
+        ctrl_angle_y = 0
+
+        ctrl_flag_last_time = ctrl_flag_last_time - 1
+        if(ctrl_flag_last_time < 0) then ctrl_flag = ctrl_flag + 1 end
+    elseif(ctrl_flag==7) then
+        ctrl_angle_x = 0
+        ctrl_angle_y = 0
+        target_height = target_height - 0.1
+        if(target_height < 2) then ctrl_flag = ctrl_flag + 1 end
+    elseif(ctrl_flag==8) then
+        if(math.abs(linearSpeed_resolute[3]) < 0.3) then target_height = 0 end
+        sim.setJointTargetPosition(revolute0,math.rad(-30))
+        sim.setJointTargetPosition(revolute1,math.rad(-30))
+        
+    end
+    --ctrl_angle_y = ctrl_angle_y * 1.0166816757698403
+    print("ctrl",ctrl_angle_x, ctrl_angle_y)
+    --ctrl_angle_x = 0
+    --ctrl_angle_y = 0
+
+    ------------------ PID Controller -------------------------------------
+
+    -- Vertical control:
+    l=sim.getVelocity(heli)
+    e_z=(target_height - pos[3])
+    cumul=cumul+e_z
+    thrust=9+pParam*e_z+iParam*cumul+dParam*(e_z-lastE)+l[3]*vParam
+    lastE=e_z
+    
+    -- Rotational control:
+    alphaCumul = alphaCumul + euler[1]
+    alphaCorr=0.00298 + (euler[1]-ctrl_angle_y)*0.225 + 1.4*(euler[1]-pAlphaE)-- + 0.005 * alphaCumul
+    pAlphaE=euler[1]
+
+    betaCumul = betaCumul + euler[2]
+    betaCorr=0.00575 + (euler[2]+ctrl_angle_x)*0.225 + 3*(euler[2]-pBetaE)-- + 0.001 * betaCumul
+    pBetaE=euler[2]
+
+    rotCorrCumul = rotCorrCumul + euler[3]
+    rotCorr=euler[3]*4 + 1*(euler[3]-prevEuler) + 0.001 * rotCorrCumul
+    prevEuler=euler[3]
+
+    -- Decide of the motor velocities:
+    particlesTargetVelocities[1]=thrust*(1-alphaCorr+betaCorr+rotCorr)
+    particlesTargetVelocities[2]=thrust*(1-alphaCorr-betaCorr-rotCorr)
+    particlesTargetVelocities[3]=thrust*(1+alphaCorr-betaCorr+rotCorr)
+    particlesTargetVelocities[4]=thrust*(1+alphaCorr+betaCorr-rotCorr)
+
+    -- Send the desired motor velocities to the 4 rotors:
+    for i=1,4,1 do
+        sim.setScriptSimulationParameter(propellerScripts[i],'particleVelocity',particlesTargetVelocities[i])
+    end
+end 
+
+
+
+
+
+
